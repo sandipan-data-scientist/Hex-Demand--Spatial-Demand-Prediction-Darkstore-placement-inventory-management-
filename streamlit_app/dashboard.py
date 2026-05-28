@@ -1,23 +1,26 @@
-# Interactive dashboard that reads the processed CSV from artifacts/
-# and shows all the charts from the notebook in a clean UI.
-# Run with: streamlit run streamlit_app/dashboard.py
+# streamlit_app/dashboard.py
+# Fully rewritten to remove plotly dependency.
+# All charts use native Streamlit chart functions which are built-in
+# and require no additional packages beyond streamlit itself.
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+import folium
+from folium.plugins import HeatMap
+from streamlit_folium import st_folium
+import h3
 import os
 
 st.set_page_config(
     page_title = "Hex-Demand Dashboard",
-    page_icon  = "map",
     layout     = "wide",
 )
 
-# ---- Load Data ----
+# ---- Load data ----
 
-CSV_PATH = os.path.join(os.path.dirname(__file__), '..', 'artifacts', 'hex_demand_processed.csv')
+CSV_PATH = os.path.join('artifacts', 'hex_demand_processed.csv')
 
 @st.cache_data
 def load_data():
@@ -29,10 +32,13 @@ def load_data():
 df = load_data()
 
 if df is None:
-    st.error("artifacts/hex_demand_processed.csv not found. Run model/train_and_save.py first.")
+    st.error(
+        "artifacts/hex_demand_processed.csv not found. "
+        "Run model/train_and_save.py first and commit the CSV to the repo."
+    )
     st.stop()
 
-# ---- Sidebar Filters ----
+# ---- Sidebar filters ----
 
 st.sidebar.title("Filters")
 
@@ -44,204 +50,218 @@ hour_range = st.sidebar.slider(
 )
 
 demand_threshold = st.sidebar.number_input(
-    "Minimum predicted demand to show",
+    "Minimum predicted demand",
     min_value = 0.0,
     max_value = float(df['predicted_demand'].max()),
     value     = 0.0,
     step      = 1.0,
 )
 
-# Apply filters
 df_filtered = df[
     (df['hour'] >= hour_range[0]) &
     (df['hour'] <= hour_range[1]) &
     (df['predicted_demand'] >= demand_threshold)
 ].copy()
 
-# Demand tier assignment
-def assign_tier(val):
-    if val >= 10:
-        return "High"
-    elif val >= 5:
-        return "Medium"
+def assign_tier(val, p33, p67):
+    if val >= p67:
+        return 'High'
+    elif val >= p33:
+        return 'Medium'
     else:
-        return "Low"
+        return 'Low'
 
-df_filtered['demand_tier'] = df_filtered['predicted_demand'].apply(assign_tier)
+p33 = df_filtered['predicted_demand'].quantile(0.33)
+p67 = df_filtered['predicted_demand'].quantile(0.67)
+df_filtered['demand_tier'] = df_filtered['predicted_demand'].apply(
+    lambda v: assign_tier(v, p33, p67)
+)
 
-# ---- Page Header ----
+# ---- Header ----
 
 st.title("Hex-Demand: Spatial Demand Forecast Dashboard")
-st.caption("Kolkata dark store demand prediction using H3 hexagonal indexing and Random Forest")
+st.caption(
+    "Kolkata dark store demand prediction using H3 hexagonal indexing "
+    "and Random Forest."
+)
 
 st.divider()
 
-# ---- KPI Row ----
+# ---- KPI row ----
 
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric("Total Hex-Hour Records", f"{len(df_filtered):,}")
-col2.metric("Unique Hexagons",        f"{df_filtered['h3_index'].nunique()}")
-col3.metric("Mean Predicted Demand",  f"{df_filtered['predicted_demand'].mean():.1f}")
-col4.metric("Max Predicted Demand",   f"{df_filtered['predicted_demand'].max():.0f}")
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Total Records",          f"{len(df_filtered):,}")
+k2.metric("Unique Hexagons",        f"{df_filtered['h3_index'].nunique()}")
+k3.metric("Mean Predicted Demand",  f"{df_filtered['predicted_demand'].mean():.1f}")
+k4.metric("Max Predicted Demand",   f"{df_filtered['predicted_demand'].max():.0f}")
 
 st.divider()
 
-# ---- Row 1: Demand Distribution and Hourly Pattern ----
+# ---- Row 1: Demand distribution and hourly pattern ----
+# Using matplotlib here instead of plotly because matplotlib is already
+# a dependency of scikit-learn and is always available on Streamlit Cloud
 
-row1_col1, row1_col2 = st.columns(2)
+r1c1, r1c2 = st.columns(2)
 
-with row1_col1:
+with r1c1:
     st.subheader("Distribution of Actual Demand")
-    fig_hist = px.histogram(
-        df_filtered,
-        x         = 'demand',
-        nbins     = 35,
-        color_discrete_sequence = ['steelblue'],
-        labels    = {'demand': 'Orders per Hexagon per Hour'},
-        title     = "How often each demand level occurs",
+    fig1, ax1 = plt.subplots(figsize=(6, 3.5))
+    ax1.hist(
+        df_filtered['demand'],
+        bins       = 35,
+        color      = 'steelblue',
+        edgecolor  = 'white',
+        linewidth  = 0.4,
     )
-    fig_hist.update_traces(marker_line_width=0.4, marker_line_color='white')
-    fig_hist.update_layout(
-        yaxis_title  = "Frequency",
-        showlegend   = False,
-        plot_bgcolor = "rgba(0,0,0,0)",
-        paper_bgcolor= "rgba(0,0,0,0)",
+    ax1.axvline(
+        df_filtered['demand'].mean(),
+        color     = 'tomato',
+        linestyle = '--',
+        linewidth = 1.5,
+        label     = f"Mean = {df_filtered['demand'].mean():.1f}"
     )
-    st.plotly_chart(fig_hist, use_container_width=True)
+    ax1.set_xlabel('Orders per Hexagon per Hour')
+    ax1.set_ylabel('Frequency')
+    ax1.legend(fontsize=9)
+    ax1.spines['top'].set_visible(False)
+    ax1.spines['right'].set_visible(False)
+    fig1.tight_layout()
+    st.pyplot(fig1, use_container_width=True)
+    plt.close(fig1)
 
-with row1_col2:
+with r1c2:
     st.subheader("Average Demand by Hour of Day")
-    hourly_avg = df_filtered.groupby('hour')['demand'].mean().reset_index()
-    fig_bar = px.bar(
-        hourly_avg,
-        x     = 'hour',
-        y     = 'demand',
-        color = 'demand',
-        color_continuous_scale = 'OrRd',
-        labels = {'hour': 'Hour of Day', 'demand': 'Avg Orders'},
-        title  = "Which hours drive the most demand",
+    hourly_avg = (
+        df_filtered.groupby('hour')['demand']
+        .mean()
+        .reset_index()
+        .rename(columns={'demand': 'avg_demand'})
+        .set_index('hour')
     )
-    fig_bar.update_layout(
-        coloraxis_showscale = False,
-        plot_bgcolor        = "rgba(0,0,0,0)",
-        paper_bgcolor       = "rgba(0,0,0,0)",
-        xaxis               = dict(tickmode='linear', dtick=1),
-    )
-    st.plotly_chart(fig_bar, use_container_width=True)
+    # st.bar_chart natively uses the dataframe index as x-axis
+    st.bar_chart(hourly_avg, use_container_width=True)
 
-# ---- Row 2: Lag Feature Scatter and Actual vs Predicted ----
+# ---- Row 2: Lag scatter and actual vs predicted ----
 
-row2_col1, row2_col2 = st.columns(2)
+r2c1, r2c2 = st.columns(2)
 
-with row2_col1:
+with r2c1:
     st.subheader("Lag-1 Demand vs Current Demand")
-    sample = df_filtered.sample(min(800, len(df_filtered)), random_state=42)
     corr_val = df_filtered[['lag_1', 'demand']].corr().iloc[0, 1]
+    st.caption(f"Pearson r = {corr_val:.3f} — higher means the lag feature carries stronger signal.")
 
-    fig_scatter = px.scatter(
-        sample,
-        x       = 'lag_1',
-        y       = 'demand',
-        opacity = 0.4,
-        color_discrete_sequence = ['royalblue'],
-        trendline = 'ols',
-        labels  = {'lag_1': 'Previous Hour Demand', 'demand': 'Current Demand'},
-        title   = f"Pearson r = {corr_val:.3f}  (higher = stronger lag signal)",
+    sample = df_filtered.sample(min(800, len(df_filtered)), random_state=42)
+    fig2, ax2 = plt.subplots(figsize=(6, 3.5))
+    ax2.scatter(
+        sample['lag_1'],
+        sample['demand'],
+        alpha = 0.35,
+        s     = 12,
+        color = 'royalblue',
     )
-    fig_scatter.update_layout(
-        plot_bgcolor  = "rgba(0,0,0,0)",
-        paper_bgcolor = "rgba(0,0,0,0)",
-    )
-    st.plotly_chart(fig_scatter, use_container_width=True)
+    # Trend line using numpy linear regression
+    m, b = np.polyfit(sample['lag_1'], sample['demand'], 1)
+    x_line = np.linspace(sample['lag_1'].min(), sample['lag_1'].max(), 100)
+    ax2.plot(x_line, m * x_line + b, color='tomato', linewidth=1.8, label='Trend')
+    ax2.set_xlabel('Previous Hour Demand (lag_1)')
+    ax2.set_ylabel('Current Demand')
+    ax2.legend(fontsize=9)
+    ax2.spines['top'].set_visible(False)
+    ax2.spines['right'].set_visible(False)
+    fig2.tight_layout()
+    st.pyplot(fig2, use_container_width=True)
+    plt.close(fig2)
 
-with row2_col2:
+with r2c2:
     st.subheader("Actual vs Predicted Demand")
+    st.caption("Points near the diagonal line mean accurate predictions.")
+
     sample2 = df_filtered.sample(min(800, len(df_filtered)), random_state=7)
-
-    fig_avp = go.Figure()
-    fig_avp.add_trace(go.Scatter(
-        x       = sample2['demand'],
-        y       = sample2['predicted_demand'],
-        mode    = 'markers',
-        marker  = dict(color='mediumseagreen', opacity=0.4, size=5),
-        name    = 'Predictions',
-    ))
-    # Perfect prediction line
+    fig3, ax3 = plt.subplots(figsize=(6, 3.5))
+    ax3.scatter(
+        sample2['demand'],
+        sample2['predicted_demand'],
+        alpha = 0.35,
+        s     = 12,
+        color = 'mediumseagreen',
+    )
     max_val = max(sample2['demand'].max(), sample2['predicted_demand'].max())
-    fig_avp.add_trace(go.Scatter(
-        x    = [0, max_val],
-        y    = [0, max_val],
-        mode = 'lines',
-        line = dict(color='tomato', dash='dash', width=1.5),
-        name = 'Perfect Prediction',
-    ))
-    fig_avp.update_layout(
-        xaxis_title   = 'Actual Demand',
-        yaxis_title   = 'Predicted Demand',
-        title         = "Points near the red line = accurate predictions",
-        plot_bgcolor  = "rgba(0,0,0,0)",
-        paper_bgcolor = "rgba(0,0,0,0)",
+    ax3.plot(
+        [0, max_val], [0, max_val],
+        color     = 'tomato',
+        linestyle = '--',
+        linewidth = 1.5,
+        label     = 'Perfect prediction',
     )
-    st.plotly_chart(fig_avp, use_container_width=True)
+    ax3.set_xlabel('Actual Demand')
+    ax3.set_ylabel('Predicted Demand')
+    ax3.legend(fontsize=9)
+    ax3.spines['top'].set_visible(False)
+    ax3.spines['right'].set_visible(False)
+    fig3.tight_layout()
+    st.pyplot(fig3, use_container_width=True)
+    plt.close(fig3)
 
-# ---- Row 3: Demand Tier Breakdown and Top Hexagons ----
+# ---- Row 3: Tier breakdown and top hexagons ----
 
-row3_col1, row3_col2 = st.columns(2)
+r3c1, r3c2 = st.columns(2)
 
-with row3_col1:
+with r3c1:
     st.subheader("Demand Tier Distribution")
-    tier_counts = df_filtered['demand_tier'].value_counts().reset_index()
-    tier_counts.columns = ['Tier', 'Count']
-    tier_color_map = {'High': '#d73027', 'Medium': '#fc8d59', 'Low': '#1a9850'}
-
-    fig_pie = px.pie(
-        tier_counts,
-        names  = 'Tier',
-        values = 'Count',
-        color  = 'Tier',
-        color_discrete_map = tier_color_map,
-        title  = "Share of hex-hour records by demand tier",
+    tier_counts = (
+        df_filtered['demand_tier']
+        .value_counts()
+        .reindex(['High', 'Medium', 'Low'])
+        .fillna(0)
+        .astype(int)
     )
-    fig_pie.update_traces(textposition='inside', textinfo='percent+label')
-    st.plotly_chart(fig_pie, use_container_width=True)
+    fig4, ax4 = plt.subplots(figsize=(5, 4))
+    colors = ['#d73027', '#fc8d59', '#1a9850']
+    ax4.pie(
+        tier_counts.values,
+        labels    = tier_counts.index,
+        colors    = colors,
+        autopct   = '%1.1f%%',
+        startangle= 140,
+        textprops = {'fontsize': 11},
+    )
+    fig4.tight_layout()
+    st.pyplot(fig4, use_container_width=True)
+    plt.close(fig4)
 
-with row3_col2:
+with r3c2:
     st.subheader("Top 15 Hexagons by Total Predicted Demand")
     top_hex = (
         df_filtered.groupby('h3_index')['predicted_demand']
         .sum()
-        .sort_values(ascending=False)
-        .head(15)
-        .reset_index()
+        .sort_values(ascending=True)
+        .tail(15)
     )
-    top_hex.columns = ['H3 Index', 'Total Predicted Demand']
-    top_hex['H3 Short'] = top_hex['H3 Index'].str[-6:]  # last 6 chars for readability
+    # Shorten h3 index to last 6 chars for readability on the axis
+    top_hex.index = top_hex.index.str[-6:]
+    top_hex = top_hex.to_frame(name='Total Predicted Demand')
 
-    fig_top = px.bar(
-        top_hex,
-        x     = 'Total Predicted Demand',
-        y     = 'H3 Short',
-        orientation = 'h',
-        color = 'Total Predicted Demand',
-        color_continuous_scale = 'Blues',
-        labels = {'H3 Short': 'Hexagon (last 6 chars of ID)'},
-        title  = "Which hexagons accumulate the most demand",
+    fig5, ax5 = plt.subplots(figsize=(6, 4))
+    ax5.barh(
+        top_hex.index,
+        top_hex['Total Predicted Demand'],
+        color     = 'royalblue',
+        edgecolor = 'white',
+        linewidth = 0.4,
     )
-    fig_top.update_layout(
-        yaxis              = dict(autorange='reversed'),
-        coloraxis_showscale= False,
-        plot_bgcolor       = "rgba(0,0,0,0)",
-        paper_bgcolor      = "rgba(0,0,0,0)",
-    )
-    st.plotly_chart(fig_top, use_container_width=True)
+    ax5.set_xlabel('Total Predicted Demand')
+    ax5.set_ylabel('Hexagon (last 6 chars)')
+    ax5.spines['top'].set_visible(False)
+    ax5.spines['right'].set_visible(False)
+    fig5.tight_layout()
+    st.pyplot(fig5, use_container_width=True)
+    plt.close(fig5)
 
-# ---- Row 4: Predicted Demand Heatmap by Hour ----
+# ---- Row 4: Demand heatmap by hour ----
 
-st.subheader("Predicted Demand Heatmap: Hour vs Hexagon Cluster")
-st.caption("Each cell shows average predicted demand for a given hour. Darker = higher demand.")
+st.subheader("Predicted Demand Heatmap: Hour vs Hexagon")
+st.caption("Darker cells mean higher average predicted demand for that hexagon during that hour.")
 
-# Use top 20 hexagons for the heatmap so it stays readable
 top20_hex = (
     df_filtered.groupby('h3_index')['demand']
     .sum()
@@ -261,110 +281,50 @@ pivot = heatmap_df.pivot_table(
     aggfunc = 'mean',
 ).fillna(0)
 
-fig_hmap = px.imshow(
-    pivot,
-    color_continuous_scale = 'YlOrRd',
-    aspect                 = 'auto',
-    labels                 = dict(x='Hour of Day', y='Hexagon', color='Predicted Demand'),
-    title                  = "Demand intensity across hours for top 20 hexagons",
-)
-fig_hmap.update_layout(
-    paper_bgcolor = "rgba(0,0,0,0)",
-    height        = 450,
-)
-st.plotly_chart(fig_hmap, use_container_width=True)
+fig6, ax6 = plt.subplots(figsize=(14, 6))
+im = ax6.imshow(pivot.values, aspect='auto', cmap='YlOrRd')
+ax6.set_xticks(range(len(pivot.columns)))
+ax6.set_xticklabels(pivot.columns, fontsize=8)
+ax6.set_yticks(range(len(pivot.index)))
+ax6.set_yticklabels(pivot.index, fontsize=8)
+ax6.set_xlabel('Hour of Day')
+ax6.set_ylabel('Hexagon (last 6 chars)')
+plt.colorbar(im, ax=ax6, label='Predicted Demand')
+fig6.tight_layout()
+st.pyplot(fig6, use_container_width=True)
+plt.close(fig6)
 
-# ---- Row 5: Raw Data Table (collapsible) ----
-
-with st.expander("View filtered raw data"):
-    st.dataframe(
-        df_filtered[['h3_index', 'hour', 'demand', 'lag_1', 'predicted_demand', 'demand_tier']],
-        use_container_width = True,
-        height              = 300,
-    )
-    st.caption(f"Showing {len(df_filtered)} rows after filters.")
-
-    # streamlit_app/dashboard.py  (map section — add after your existing charts)
-#
-# This section builds a Folium hexagon map from the processed CSV and
-# renders it live inside Streamlit using streamlit-folium.
-# The map colours each H3 hexagon by its predicted demand tier.
-
-import streamlit as st
-import pandas as pd
-import numpy as np
-import folium
-from folium.plugins import HeatMap
-from streamlit_folium import st_folium
-import h3
-import os
-
-# ---- Load data ----
-# Re-use the cached df from the top of your dashboard if it is already loaded.
-# If you are adding this as a standalone section, load it here.
-
-CSV_PATH = os.path.join(os.path.dirname(__file__), '..', 'artifacts', 'hex_demand_processed.csv')
-
-@st.cache_data
-def load_hex_data():
-    if not os.path.exists(CSV_PATH):
-        return None
-    df = pd.read_csv(CSV_PATH)
-    return df
-
-df = load_hex_data()
-
-if df is None:
-    st.error("artifacts/hex_demand_processed.csv not found. Run model/train_and_save.py first.")
-    st.stop()
-
-# ---- Section header ----
+# ---- Folium map ----
 
 st.divider()
 st.subheader("Predicted Demand Heatmap: Hexagonal City Grid")
 st.caption(
-    "Each hexagon on the map represents one H3 spatial cell at resolution 8 "
-    "(approximately 0.74 sq km). Fill colour and opacity reflect predicted "
-    "demand intensity. Click any hexagon to see its exact predicted demand value."
+    "Each hexagon represents one H3 spatial cell at resolution 8 "
+    "(approximately 0.74 sq km). Click any hexagon for details."
 )
-
-# ---- Map controls in a horizontal row ----
 
 map_col1, map_col2, map_col3 = st.columns(3)
 
 with map_col1:
     selected_hour = st.selectbox(
-        "Filter by Hour of Day",
-        options    = ["All Hours"] + sorted(df['hour'].unique().tolist()),
-        index      = 0,
-        help       = "Show only hexagons active during a specific hour."
+        "Filter Map by Hour",
+        options = ["All Hours"] + sorted(df['hour'].unique().tolist()),
+        index   = 0,
     )
-
 with map_col2:
     color_scheme = st.selectbox(
         "Colour Scheme",
-        options = ["Red intensity", "Traffic light tiers", "Blue gradient"],
+        options = ["Traffic light tiers", "Red intensity", "Blue gradient"],
         index   = 0,
-        help    = "How hexagons are coloured on the map."
     )
-
 with map_col3:
-    show_heatmap_layer = st.checkbox(
-        "Overlay raw HeatMap layer",
-        value = False,
-        help  = "Adds a kernel density heatmap on top of the hexagons, "
-                "useful for seeing where order points are densest."
-    )
-
-# ---- Filter data based on controls ----
+    show_heatmap_layer = st.checkbox("Overlay raw HeatMap layer", value=False)
 
 if selected_hour == "All Hours":
     df_map = df.copy()
 else:
     df_map = df[df['hour'] == int(selected_hour)].copy()
 
-# If multiple hours are included, take each hexagon's mean predicted demand
-# so there is one value per hexagon on the map
 df_agg = (
     df_map.groupby('h3_index')
     .agg(
@@ -375,61 +335,30 @@ df_agg = (
     .reset_index()
 )
 
-# ---- Demand tier assignment ----
-# Thresholds are percentile-based on the aggregated snapshot
-# so the colour spread adapts to the current filter selection
-
-p33 = df_agg['predicted_demand'].quantile(0.33)
-p67 = df_agg['predicted_demand'].quantile(0.67)
-
-def assign_tier(val):
-    if val >= p67:
-        return 'High'
-    elif val >= p33:
-        return 'Medium'
-    else:
-        return 'Low'
-
-df_agg['demand_tier'] = df_agg['predicted_demand'].apply(assign_tier)
-
-# ---- Colour logic per scheme ----
+p33m = df_agg['predicted_demand'].quantile(0.33)
+p67m = df_agg['predicted_demand'].quantile(0.67)
+df_agg['demand_tier'] = df_agg['predicted_demand'].apply(
+    lambda v: assign_tier(v, p33m, p67m)
+)
 
 max_pred = df_agg['predicted_demand'].max()
-# Protect against divide-by-zero if all predictions are the same value
 if max_pred == 0:
     max_pred = 1.0
 
 def get_hex_color_and_opacity(row, scheme):
     tier = row['demand_tier']
-    norm = row['predicted_demand'] / max_pred  # 0.0 to 1.0
-
+    norm = row['predicted_demand'] / max_pred
     if scheme == "Red intensity":
-        # Single red hue, opacity proportional to demand
-        # Low opacity = faint red, high opacity = solid red
         return '#cc2200', max(0.15, norm)
-
     elif scheme == "Traffic light tiers":
-        # Three-colour system matching the notebook's map legend
-        color_map = {'High': '#d73027', 'Medium': '#fc8d59', 'Low': '#1a9850'}
-        return color_map[tier], 0.65
-
-    elif scheme == "Blue gradient":
-        # Dark blue for high demand, light blue for low
-        # We interpolate between two hex colours manually
+        return {'High': '#d73027', 'Medium': '#fc8d59', 'Low': '#1a9850'}[tier], 0.65
+    else:
         if norm >= 0.67:
-            return '#08306b', 0.75   # darkest blue
+            return '#08306b', 0.75
         elif norm >= 0.33:
-            return '#2171b5', 0.60   # mid blue
+            return '#2171b5', 0.60
         else:
-            return '#9ecae1', 0.45   # light blue
-
-    return '#cc2200', norm           # fallback
-
-
-# ---- Get hexagon boundary coordinates ----
-# h3.cell_to_boundary returns list of (lat, lon) tuples (h3-py v4 API)
-# h3.h3_to_geo_boundary returns same in v3 API
-# We handle both with a try/except so this works on either version
+            return '#9ecae1', 0.45
 
 def get_boundary(h3_idx):
     try:
@@ -443,66 +372,45 @@ def get_center(h3_idx):
     except AttributeError:
         return h3.h3_to_geo(h3_idx)
 
-
-# ---- Build the Folium map ----
-
-# Center on Kolkata (matching the notebook)
 KOLKATA_LAT = 22.5726
 KOLKATA_LON = 88.3639
 
 m = folium.Map(
     location   = [KOLKATA_LAT, KOLKATA_LON],
     zoom_start = 12,
-    tiles      = 'CartoDB dark_matter',   # dark background makes coloured hexagons pop
+    tiles      = 'CartoDB dark_matter',
 )
 
-# Draw each hexagon as a polygon
 for _, row in df_agg.iterrows():
-    h3_idx   = row['h3_index']
     color, opacity = get_hex_color_and_opacity(row, color_scheme)
-
-    boundary = get_boundary(h3_idx)
-    # Folium Polygon expects [[lat, lon], ...]
+    boundary       = get_boundary(row['h3_index'])
     polygon_coords = [[lat, lon] for lat, lon in boundary]
 
-    # Build a clean popup with all relevant info
-    # folium.Popup with html=True lets us format it nicely
     popup_html = f"""
-        <div style="font-family: Arial, sans-serif; font-size: 13px; min-width: 180px;">
+        <div style="font-family:Arial,sans-serif;font-size:13px;min-width:180px">
             <b>H3 Index</b><br>
-            <code style="font-size:11px">{h3_idx}</code><br><br>
-            <b>Predicted Demand:</b> {row['predicted_demand']:.1f} orders<br>
-            <b>Actual Demand:</b>    {row['actual_demand']:.1f} orders<br>
-            <b>Demand Tier:</b>      {row['demand_tier']}<br>
-            <b>Hours Covered:</b>    {int(row['hours_seen'])}
+            <code style="font-size:11px">{row['h3_index']}</code><br><br>
+            <b>Predicted Demand:</b> {row['predicted_demand']:.1f}<br>
+            <b>Actual Demand:</b> {row['actual_demand']:.1f}<br>
+            <b>Tier:</b> {row['demand_tier']}
         </div>
     """
-
     folium.Polygon(
         locations    = polygon_coords,
         color        = color,
-        weight       = 0.8,               # border thickness
+        weight       = 0.8,
         fill         = True,
         fill_color   = color,
         fill_opacity = opacity,
         popup        = folium.Popup(popup_html, max_width=250),
-        tooltip      = f"{row['demand_tier']} demand: {row['predicted_demand']:.1f} orders",
+        tooltip      = f"{row['demand_tier']}: {row['predicted_demand']:.1f} orders",
     ).add_to(m)
-
-
-# ---- Optional raw HeatMap layer ----
-# This uses the actual order locations (approximated from hex centres)
-# to draw a kernel density heatmap on top of the hexagons
-# It gives a different visual: a smooth heat gradient vs discrete hexagons
 
 if show_heatmap_layer:
     heat_data = []
     for _, row in df_agg.iterrows():
-        center = get_center(row['h3_index'])
-        lat, lon = center[0], center[1]
-        weight = row['predicted_demand']
-        heat_data.append([lat, lon, weight])
-
+        c = get_center(row['h3_index'])
+        heat_data.append([c[0], c[1], row['predicted_demand']])
     HeatMap(
         heat_data,
         min_opacity = 0.2,
@@ -512,96 +420,45 @@ if show_heatmap_layer:
         gradient    = {0.4: 'blue', 0.65: 'lime', 0.85: 'orange', 1.0: 'red'},
     ).add_to(m)
 
-
-# ---- Map legend (injected as HTML into the Folium map) ----
-# This is the same approach as the notebook's standalone map
-
-if color_scheme == "Traffic light tiers":
-    legend_html = """
-    <div style="
-        position: fixed; bottom: 30px; left: 30px;
-        background: rgba(20,20,30,0.92);
-        color: white; padding: 12px 16px;
-        border-radius: 8px; font-family: Arial, sans-serif;
-        font-size: 13px; z-index: 9999;
-        border: 1px solid #555;
-    ">
-        <b>Demand Tier</b><br>
-        <span style="color:#d73027">&#9632;</span> High<br>
-        <span style="color:#fc8d59">&#9632;</span> Medium<br>
-        <span style="color:#1a9850">&#9632;</span> Low
-    </div>
-    """
-elif color_scheme == "Red intensity":
-    legend_html = """
-    <div style="
-        position: fixed; bottom: 30px; left: 30px;
-        background: rgba(20,20,30,0.92);
-        color: white; padding: 12px 16px;
-        border-radius: 8px; font-family: Arial, sans-serif;
-        font-size: 13px; z-index: 9999;
-        border: 1px solid #555;
-    ">
-        <b>Demand Intensity</b><br>
-        <span style="color:#cc2200; opacity:1.0">&#9632;</span> High<br>
-        <span style="color:#cc2200; opacity:0.5">&#9632;</span> Medium<br>
-        <span style="color:#cc2200; opacity:0.2">&#9632;</span> Low
-    </div>
-    """
-else:
-    legend_html = """
-    <div style="
-        position: fixed; bottom: 30px; left: 30px;
-        background: rgba(20,20,30,0.92);
-        color: white; padding: 12px 16px;
-        border-radius: 8px; font-family: Arial, sans-serif;
-        font-size: 13px; z-index: 9999;
-        border: 1px solid #555;
-    ">
-        <b>Demand Level</b><br>
-        <span style="color:#08306b">&#9632;</span> High<br>
-        <span style="color:#2171b5">&#9632;</span> Medium<br>
-        <span style="color:#9ecae1">&#9632;</span> Low
-    </div>
-    """
-
+legend_colors = {
+    "Traffic light tiers": [('#d73027','High'), ('#fc8d59','Medium'), ('#1a9850','Low')],
+    "Red intensity":       [('#cc2200','High'), ('#cc220088','Medium'), ('#cc220033','Low')],
+    "Blue gradient":       [('#08306b','High'), ('#2171b5','Medium'),   ('#9ecae1','Low')],
+}
+legend_rows = "".join(
+    f'<span style="color:{c}">&#9632;</span> {label}<br>'
+    for c, label in legend_colors[color_scheme]
+)
+legend_html = f"""
+<div style="position:fixed;bottom:30px;left:30px;
+    background:rgba(20,20,30,0.92);color:white;
+    padding:12px 16px;border-radius:8px;
+    font-family:Arial,sans-serif;font-size:13px;
+    z-index:9999;border:1px solid #555">
+    <b>Demand Tier</b><br>{legend_rows}
+</div>
+"""
 m.get_root().html.add_child(folium.Element(legend_html))
 
-
-# ---- Render the map in Streamlit ----
-# st_folium streams the Folium map object directly into the Streamlit page.
-# returned_objects captures what the user clicks on, enabling reactive behaviour.
-# use_container_width=True makes the map fill the full column width.
-
-map_output = st_folium(
+st_folium(
     m,
-    width              = "100%",
-    height             = 550,
-    returned_objects   = ["last_object_clicked_popup"],
-    use_container_width= True,
+    width               = "100%",
+    height              = 550,
+    returned_objects    = ["last_object_clicked_popup"],
+    use_container_width = True,
 )
 
-# ---- Show clicked hexagon details below the map ----
-# When the user clicks a hexagon, the popup HTML comes back in map_output.
-# We surface it as a clean info box below the map as well.
+sc1, sc2, sc3 = st.columns(3)
+sc1.metric("High Zones",   (df_agg['demand_tier'] == 'High').sum())
+sc2.metric("Medium Zones", (df_agg['demand_tier'] == 'Medium').sum())
+sc3.metric("Low Zones",    (df_agg['demand_tier'] == 'Low').sum())
 
-if map_output and map_output.get("last_object_clicked_popup"):
-    st.info(
-        "Hexagon clicked. See the popup on the map above for full details, "
-        "or filter by hour using the controls above to isolate that zone."
+# ---- Raw data table ----
+
+with st.expander("View filtered raw data"):
+    st.dataframe(
+        df_filtered[['h3_index','hour','demand','lag_1','predicted_demand','demand_tier']],
+        use_container_width = True,
+        height              = 300,
     )
-
-
-# ---- Summary stats for current map view ----
-
-st.caption(f"Showing {len(df_agg)} hexagons on the map.")
-
-summary_col1, summary_col2, summary_col3 = st.columns(3)
-
-high_count   = (df_agg['demand_tier'] == 'High').sum()
-medium_count = (df_agg['demand_tier'] == 'Medium').sum()
-low_count    = (df_agg['demand_tier'] == 'Low').sum()
-
-summary_col1.metric("High Demand Zones",   high_count,   help="Hexagons above the 67th percentile of predicted demand")
-summary_col2.metric("Medium Demand Zones", medium_count, help="Hexagons between the 33rd and 67th percentile")
-summary_col3.metric("Low Demand Zones",    low_count,    help="Hexagons below the 33rd percentile of predicted demand")
+    st.caption(f"Showing {len(df_filtered)} rows.")

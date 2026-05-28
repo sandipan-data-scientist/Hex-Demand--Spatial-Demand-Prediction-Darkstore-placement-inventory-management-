@@ -2,7 +2,7 @@ numpy
 pandas
 scikit-learn
 h3==3.7.6
-folium==0.16.0
+folium
 matplotlib
 seaborn
 fastapi

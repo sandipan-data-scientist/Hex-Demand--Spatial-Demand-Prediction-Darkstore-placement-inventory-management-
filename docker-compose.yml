@@ -1,0 +1,29 @@
+# Runs both the FastAPI backend and the Streamlit dashboard together.
+# Run with: docker-compose up --build
+
+version: "3.9"
+
+services:
+
+  api:
+    build: .
+    container_name: hex_demand_api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount artifacts folder so the CSV is accessible at runtime
+      - ./artifacts:/app/artifacts
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    container_name: hex_demand_dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./artifacts:/app/artifacts
+    depends_on:
+      - api
+    restart: unless-stopped

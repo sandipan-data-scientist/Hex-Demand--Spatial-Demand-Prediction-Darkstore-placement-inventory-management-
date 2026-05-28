@@ -1,9 +1,0 @@
-__pycache__/
-.ipynb_checkpoints/
-venv/
-.env
-*.pkl
-*.h5
-*.pt
-*.joblib
-.DS_Store

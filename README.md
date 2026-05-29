@@ -6,6 +6,7 @@ Blinkit manage dark store operations. Built end-to-end in Python: from synthetic
 data generation to an interactive Folium map, a FastAPI prediction service, a
 Streamlit dashboard, and full Docker containerisation.
 
+Check out the dashboard with demand - geospatial visualisation [Dashboard link](https://huggingface.co/spaces/Sandipandatascientist/hex-demand)
 ---
 
 ## Table of Contents
